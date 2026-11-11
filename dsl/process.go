@@ -88,6 +88,40 @@ func TrimEOL(s string) string {
 	return strings.TrimSuffix(s, "\r")
 }
 
+
+// readProcessLines reads newline-delimited output without the default
+// bufio.Scanner 64KiB token limit. Long lines are reassembled via
+// bufio.Reader.ReadLine so the cmd channel can emit them.
+func readProcessLines(r io.Reader, emit func(string) error) error {
+	br := bufio.NewReader(r)
+	for {
+		var buf []byte
+		for {
+			part, isPrefix, err := br.ReadLine()
+			if len(part) > 0 {
+				buf = append(buf, part...)
+			}
+			if err != nil {
+				if err == io.EOF {
+					if len(buf) > 0 {
+						if emitErr := emit(string(buf)); emitErr != nil {
+							return emitErr
+						}
+					}
+					return nil
+				}
+				return err
+			}
+			if !isPrefix {
+				break
+			}
+		}
+		if err := emit(string(buf)); err != nil {
+			return err
+		}
+	}
+}
+
 // Start starts the program, which runs in the background (until the
 // test is complete).
 //
@@ -127,19 +161,18 @@ func (p *Process) Start(ctx *Ctx) error {
 	}
 
 	go func() {
-		in := bufio.NewScanner(errPipe)
-		for in.Scan() {
-			line := in.Text()
+		err := readProcessLines(errPipe, func(line string) error {
 			ctx.Logf("Process %s stderr line: %s\n", p.Name, line)
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			case <-p.ctl:
-				return
+				return nil  // process stopped
 			case p.Stderr <- line:
+				return nil
 			}
-		}
-		if err := in.Err(); err != nil {
+		})
+		if err != nil && err != ctx.Err() {
 			ctx.Logf("Process %s stderr error %s", p.Name, err)
 		}
 	}()
@@ -150,19 +183,18 @@ func (p *Process) Start(ctx *Ctx) error {
 	}
 
 	go func() {
-		in := bufio.NewScanner(outPipe)
-		for in.Scan() {
-			line := in.Text()
+		err := readProcessLines(outPipe, func(line string) error {
 			ctx.Logf("Process %s stdout line: %s\n", p.Name, line)
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			case <-p.ctl:
-				return
+				return nil  // process stopped
 			case p.Stdout <- line:
+				return nil
 			}
-		}
-		if err := in.Err(); err != nil {
+		})
+		if err != nil && err != ctx.Err() {
 			ctx.Logf("Process %s stdout error %s", p.Name, err)
 		}
 	}()
